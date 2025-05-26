@@ -106,5 +106,6 @@ class Integration {
             'refresh_token' => $token->getRefreshToken(),
             'expires' => $token->getExpires()
         ]));
+        error_log('Tokens saved.');
     }
 }
