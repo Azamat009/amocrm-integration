@@ -1,0 +1,34 @@
+#version: '3.8'
+
+services:
+  app:
+    image: php:8.2-apache
+    container_name: amocrm_app
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - ./:/var/www/html
+    environment:
+      - AMOCRM_CLIENT_ID=${AMOCRM_CLIENT_ID}
+      - AMOCRM_CLIENT_SECRET=${AMOCRM_CLIENT_SECRET}
+      - AMOCRM_REDIRECT_URI=${AMOCRM_REDIRECT_URI}
+      - AMOCRM_SUBDOMAIN=${AMOCRM_SUBDOMAIN}
+    networks:
+      - amocrm-net
+    command: bash -c "sed -ri -e 's!/var/www/html!/var/www/html/public!g' /etc/apache2/sites-available/*.conf
+      && a2enmod rewrite
+      && docker-php-entrypoint apache2-foreground"
+
+  composer:
+    image: composer:2
+    volumes:
+      - ./:/var/www/html
+    working_dir: /var/www/html
+    command: install --no-dev --no-scripts
+    networks:
+      - amocrm-net
+
+networks:
+  amocrm-net:
+

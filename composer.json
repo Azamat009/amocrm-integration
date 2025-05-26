@@ -1,0 +1,13 @@
+{
+  "require": {
+    "php": ">=8.2",
+    "ext-curl": "*",
+    "ext-json": "*",
+    "amocrm/amocrm-api-library": "^1.13"
+  },
+  "autoload": {
+    "psr-4": {
+      "AmoCRM\\": "src/"
+    }
+  }
+}
