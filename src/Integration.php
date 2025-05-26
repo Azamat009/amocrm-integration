@@ -23,6 +23,8 @@ class Integration {
             $this->clientSecret,
             $this->redirectUri
         );
+
+        $this->client->setAccountBaseDomain($this->subdomain . '.amocrm.ru');
     }
 
     public function getAuthUrl(): string
@@ -40,7 +42,8 @@ class Integration {
             $this->saveTokens($token);
             echo "Authorization success! Tokens saved.";
         } catch (AmoCRMoAuthApiException $e) {
-            error_log($e->getMessage());
+            error_log("OAuth error: " . $e->getMessage() . " | Code: " . $e->getCode());
+            echo "Ошибка авторизации: " . $e->getMessage();
             http_response_code(500);
         }
     }
@@ -52,6 +55,8 @@ class Integration {
     }
 
     private function processEvent(array $event): void {
+        $this->loadTokens();
+
         $entityType = explode('_', $event['type'])[0];
         $entityId = $event[$entityType.'s'][0]['id'];
 
@@ -96,7 +101,7 @@ class Integration {
                 ->setText($text);
             $notesService->add($note);
         } catch (Exception $e) {
-            error_log('Ошибка добавления заметки: ' . $e->getMessage());
+            echo ('Ошибка добавления заметки: ' . $e->getMessage());
         }
     }
 
@@ -106,6 +111,24 @@ class Integration {
             'refresh_token' => $token->getRefreshToken(),
             'expires' => $token->getExpires()
         ]));
-        error_log('Tokens saved.');
+        echo ('Tokens saved.');
+    }
+
+    private function loadTokens(): void {
+        $filePath = __DIR__.'/../data/tokens.json';
+        if (!is_dir(dirname($filePath))) {
+            mkdir(dirname($filePath), 0755, true);
+        }
+        if (file_exists(__DIR__ . '/../data/tokens.json')) {
+            $tokens = json_decode(file_get_contents(__DIR__ . '/../data/tokens.json'), true);
+            if (time() > $tokens['expires']) {
+                $newToken = $this->client->getOAuthClient()->getAccessTokenByRefreshToken($tokens['refresh_token']);
+                $this->saveTokens($newToken);
+                $tokens = $newToken;
+                echo ('Tokens updated.');
+            }
+        } else {
+            echo ('Токены не найдены. Сначала выполните авторизацию.');
+        }
     }
 }
