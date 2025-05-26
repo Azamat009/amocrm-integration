@@ -4,6 +4,7 @@ require __DIR__ . '/../vendor/autoload.php';
 use AmoCRM\Client\AmoCRMApiClient;
 use AmoCRM\Exceptions\AmoCRMoAuthApiException;
 use AmoCRM\Models\NoteModel;
+use League\OAuth2\Client\Token\AccessToken;
 
 class Integration {
     private $client;
@@ -18,6 +19,8 @@ class Integration {
         $this->redirectUri = getenv('AMOCRM_REDIRECT_URI');
         $this->subdomain = getenv('AMOCRM_SUBDOMAIN');
 
+        file_put_contents(__DIR__ . '/../data/constructor.log', "Constructor: clientId={$this->clientId}, redirectUri={$this->redirectUri}, subdomain={$this->subdomain}\n", FILE_APPEND);
+
         $this->client = new AmoCRMApiClient(
             $this->clientId,
             $this->clientSecret,
@@ -30,66 +33,90 @@ class Integration {
     public function getAuthUrl(): string
     {
         $oauthClient = $this->client->getOAuthClient();
-        return $oauthClient->getAuthorizeUrl([
+        $url = $oauthClient->getAuthorizeUrl([
             'state' => bin2hex(random_bytes(16)),
-            'mode' => 'post_message',
         ]);
+        file_put_contents(__DIR__ . '/../data/auth_url.log', "Generated Auth URL: $url\n", FILE_APPEND);
+        return $url;
     }
 
     public function handleOAuth(string $code): void {
         try {
+            file_put_contents(__DIR__ . '/../data/oauth.log', "Handling OAuth with code: $code\n", FILE_APPEND);
             $token = $this->client->getOAuthClient()->getAccessTokenByCode($code);
             $this->saveTokens($token);
             echo "Authorization success! Tokens saved.";
         } catch (AmoCRMoAuthApiException $e) {
-            error_log("OAuth error: " . $e->getMessage() . " | Code: " . $e->getCode());
+            $error = "OAuth error: " . $e->getMessage() . " | Code: " . $e->getCode();
+            error_log($error);
+            file_put_contents(__DIR__ . '/../data/oauth.log', $error . "\n", FILE_APPEND);
             echo "Ошибка авторизации: " . $e->getMessage();
             http_response_code(500);
         }
     }
 
     public function handleWebhook(array $data): void {
-        foreach ($data['events'] as $event) {
-            $this->processEvent($event);
+        file_put_contents(__DIR__ . '/../data/webhook.log', "Webhook data: " . print_r($data, true) . "\n", FILE_APPEND);
+        $eventTypes = ['leads', 'contacts'];
+        $actions = ['add', 'update'];
+
+        foreach ($eventTypes as $entityType) {
+            foreach ($actions as $action) {
+                $key = $entityType . '[' . $action . ']';
+                if (isset($data[$key])) {
+                    foreach ($data[$key] as $entityData) {
+                        $this->processEvent($entityType, $action, $entityData);
+                    }
+                }
+            }
         }
     }
 
-    private function processEvent(array $event): void {
+    private function processEvent(string $entityType, string $action, array $entityData): void {
         $this->loadTokens();
-
-        $entityType = explode('_', $event['type'])[0];
-        $entityId = $event[$entityType.'s'][0]['id'];
-
-        $entity = $this->client->{$entityType.'s'}()->getOne($entityId);
-
-        $noteText = $this->generateNoteText($event, $entity);
+        $entityId = $entityData['id'];
+        $noteText = $this->generateNoteText($action, $entityType, $entityData);
+        file_put_contents(__DIR__ . '/../data/event.log', "Processing event: type=$entityType, action=$action, id=$entityId, note=$noteText\n", FILE_APPEND);
         $this->addNote($entityType, $entityId, $noteText);
     }
 
-    private function generateNoteText(array $event, $entity): string {
-        $type = explode('_', $event['type'])[1];
-        $time = date('Y-m-d H:i:s');
+    private function generateNoteText(string $action, string $entityType, array $entityData): string {
+        $time = date('Y-m-d H:i:s', $entityData[$action === 'add' ? 'date_create' : 'updated_at'] ?? time());
 
-        if ($type === 'add') {
+        if ($action === 'add') {
+            $responsibleUserId = $entityData['responsible_user_id'];
+            try {
+                $user = $this->client->users()->getOne($responsibleUserId);
+                $userName = $user->getName();
+            } catch (Exception $e) {
+                $userName = "Unknown (ID: $responsibleUserId)";
+                file_put_contents(__DIR__ . '/../data/error.log', "Failed to fetch user $responsibleUserId: " . $e->getMessage() . "\n", FILE_APPEND);
+            }
+
             return sprintf(
-                "Создана новая %s\nНазвание: %s\nОтветственный: %s\nВремя: %s",
-                $entity->name,
-                $entity->responsible_user_id,
+                "%s добавлен(а): %s, ответственный: %s, время: %s",
+                $entityType === 'leads' ? 'Сделка' : 'Контакт',
+                $entityData['name'] ?? 'Без названия',
+                $userName,
+                $time
+            );
+        } elseif ($action === 'update') {
+            $changedFields = [];
+            if (isset($entityData['name'])) {
+                $changedFields[] = "Название: " . $entityData['name'];
+            }
+            if ($entityType === 'leads' && isset($entityData['status_id'])) {
+                $changedFields[] = "Статус: " . $entityData['status_id'];
+            }
+            $changedText = implode(', ', $changedFields);
+            return sprintf(
+                "%s изменен(а): %s, время: %s",
+                $entityType === 'leads' ? 'Сделка' : 'Контакт',
+                $changedText ?: 'без изменений',
                 $time
             );
         }
-
-        $changes = [];
-        foreach ($entity->custom_fields_values as $field) {
-            $changes[] = "{$field->field_name}: {$field->values[0]->value}";
-        }
-
-        return sprintf(
-            "Изменения в %s\n%s\nВремя: %s",
-            $entity->name,
-            implode("\n", $changes),
-            $time
-        );
+        return '';
     }
 
     private function addNote(string $entityType, int $id, string $text): void {
@@ -99,36 +126,54 @@ class Integration {
             $note
                 ->setEntityId($id)
                 ->setText($text);
-            $notesService->add($note);
+            $notesService->addOne($note);
+            file_put_contents(__DIR__ . '/../data/note.log', "Added note for $entityType ID $id: $text\n", FILE_APPEND);
         } catch (Exception $e) {
-            echo ('Ошибка добавления заметки: ' . $e->getMessage());
+            $error = "Ошибка добавления заметки для $entityType ID $id: " . $e->getMessage();
+            error_log($error);
+            file_put_contents(__DIR__ . '/../data/error.log', $error . "\n", FILE_APPEND);
+            echo $error;
         }
     }
 
     private function saveTokens($token): void {
-        file_put_contents(__DIR__.'/../data/tokens.json', json_encode([
-            'access_token' => $token->getAccessToken(),
+        $tokenData = [
+            'access_token' => $token->getToken(),
             'refresh_token' => $token->getRefreshToken(),
-            'expires' => $token->getExpires()
-        ]));
-        echo ('Tokens saved.');
+            'expires' => $token->getExpires(),
+            'baseDomain' => $this->subdomain . '.amocrm.ru',
+        ];
+        if (!is_dir(__DIR__ . '/../data')) {
+            mkdir(__DIR__ . '/../data', 0755, true);
+        }
+        file_put_contents(__DIR__ . '/../data/tokens.json', json_encode($tokenData));
+        file_put_contents(__DIR__ . '/../data/token.log', "Tokens saved: " . print_r($tokenData, true) . "\n", FILE_APPEND);
+        echo "Tokens saved.";
     }
 
     private function loadTokens(): void {
-        $filePath = __DIR__.'/../data/tokens.json';
-        if (!is_dir(dirname($filePath))) {
-            mkdir(dirname($filePath), 0755, true);
-        }
-        if (file_exists(__DIR__ . '/../data/tokens.json')) {
-            $tokens = json_decode(file_get_contents(__DIR__ . '/../data/tokens.json'), true);
-            if (time() > $tokens['expires']) {
-                $newToken = $this->client->getOAuthClient()->getAccessTokenByRefreshToken($tokens['refresh_token']);
-                $this->saveTokens($newToken);
-                $tokens = $newToken;
-                echo ('Tokens updated.');
+        $filePath = __DIR__ . '/../data/tokens.json';
+        if (file_exists($filePath)) {
+            $tokenData = json_decode(file_get_contents($filePath), true);
+            $accessToken = new AccessToken([
+                'access_token' => $tokenData['access_token'],
+                'refresh_token' => $tokenData['refresh_token'],
+                'expires' => $tokenData['expires'],
+                'baseDomain' => $tokenData['baseDomain'],
+            ]);
+            if ($accessToken->hasExpired()) {
+                file_put_contents(__DIR__ . '/../data/token.log', "Token expired, refreshing...\n", FILE_APPEND);
+                $newAccessToken = $this->client->getOAuthClient()->getAccessTokenByRefreshToken($accessToken->getRefreshToken());
+                $this->saveTokens($newAccessToken);
+                $accessToken = $newAccessToken;
+                echo "Tokens updated.";
             }
+            $this->client->setAccessToken($accessToken);
         } else {
-            echo ('Токены не найдены. Сначала выполните авторизацию.');
+            $error = "Токены не найдены. Сначала выполните авторизацию.";
+            file_put_contents(__DIR__ . '/../data/error.log', $error . "\n", FILE_APPEND);
+            echo $error;
+            exit;
         }
     }
 }
